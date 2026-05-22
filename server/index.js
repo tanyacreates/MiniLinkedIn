@@ -7,11 +7,14 @@ require("dotenv").config();
 
 // Pin DNS to Google + Cloudflare so Atlas SRV lookups don't SERVFAIL on
 // stale IPv6 link-local resolvers (a known Node-on-macOS quirk).
-try {
-  dns.setServers(["8.8.8.8", "1.1.1.1", "8.8.4.4"]);
-  dns.setDefaultResultOrder?.("ipv4first");
-} catch (e) {
-  // best-effort
+// Only do this locally — on Vercel it can break Atlas SRV resolution.
+if (!process.env.VERCEL) {
+  try {
+    dns.setServers(["8.8.8.8", "1.1.1.1", "8.8.4.4"]);
+    dns.setDefaultResultOrder?.("ipv4first");
+  } catch (e) {
+    // best-effort
+  }
 }
 
 const app = express();
@@ -59,26 +62,32 @@ app.get("/", (req, res) => {
   });
 });
 
-// MongoDB connection with better error handling
+// MongoDB connection with better error handling.
+// On serverless (Vercel) the same container is reused across invocations,
+// so we cache the connection promise and reuse it instead of reconnecting.
+let connPromise = null;
 const connectDB = async () => {
-  try {
-    const mongoURI =
-      process.env.MONGODB_URI || "mongodb://localhost:27017/mini-linkedin";
+  if (mongoose.connection.readyState === 1) return mongoose.connection;
+  if (connPromise) return connPromise;
 
-    await mongoose.connect(mongoURI, {
-      useNewUrlParser: true,
-      useUnifiedTopology: true,
+  const mongoURI =
+    process.env.MONGODB_URI || "mongodb://localhost:27017/mini-linkedin";
+
+  connPromise = mongoose
+    .connect(mongoURI, {
+      serverSelectionTimeoutMS: 10000,
+    })
+    .then((m) => {
+      console.log("MongoDB connected successfully");
+      return m.connection;
+    })
+    .catch((error) => {
+      console.error("MongoDB connection error:", error.message);
+      connPromise = null; // allow a retry on the next request
+      throw error;
     });
 
-    console.log("MongoDB connected successfully");
-  } catch (error) {
-    console.error("MongoDB connection error:", error.message);
-    // Don't exit process in production, let Render handle restarts
-    if (process.env.NODE_ENV !== "production") {
-      process.exit(1);
-    }
-    setTimeout(connectDB, 5000); // Retry after 5 seconds
-  }
+  return connPromise;
 };
 
 // Handle MongoDB connection events
@@ -97,6 +106,19 @@ mongoose.connection.on("error", (err) => {
 app.use((req, res, next) => {
   console.log(`${req.method} ${req.path} - ${new Date().toISOString()}`);
   next();
+});
+
+// Ensure the DB is connected before handling API requests (serverless-safe).
+app.use("/api", async (req, res, next) => {
+  try {
+    await connectDB();
+    next();
+  } catch (error) {
+    res.status(503).json({
+      message: "Database unavailable",
+      error: error.message,
+    });
+  }
 });
 
 // Routes with better error handling and debugging
@@ -199,12 +221,11 @@ process.on("SIGINT", async () => {
 }
 });
 
-// Connect to database
-connectDB();
-
 // Start a long-running server only when NOT on Vercel.
-// On Vercel the exported `app` is wrapped as a serverless function instead.
+// On Vercel the exported `app` is wrapped as a serverless function instead,
+// and the DB connects lazily via the /api middleware above.
 if (!process.env.VERCEL) {
+  connectDB().catch((e) => console.error("Initial DB connect failed:", e.message));
   const server = app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on port ${PORT}`);
     console.log(`Environment: ${process.env.NODE_ENV || "development"}`);
